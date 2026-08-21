@@ -1,0 +1,1045 @@
+// app_lifecycle.cpp
+//
+// Application lifecycle and initialization.
+
+#include "plc_emulator/core/application.h"
+#include "plc_emulator/audio/audio_circuit_runtime.h"
+#include "plc_emulator/audio/audio_stream_bridge.h"
+#include "plc_emulator/core/win32_input.h"
+#include "plc_emulator/core/win32_haptics.h"
+#include "plc_emulator/core/windows_power_utils.h"
+#include "plc_emulator/lang/lang_manager.h"
+#include "plc_emulator/core/ui_settings.h"
+
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+
+#include <glad/glad.h>
+
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <windows.h>
+#include <mmsystem.h>
+#include <GLFW/glfw3native.h>
+#endif
+
+#include <algorithm>
+#include <cstring>
+#include <iostream>
+#include <string>
+
+namespace plc {
+namespace {
+Application* g_physics_warning_app = nullptr;
+
+void PhysicsWarningDialogCallback(const char* message) {
+  if (g_physics_warning_app && message) {
+    g_physics_warning_app->QueuePhysicsWarningDialog(message);
+  }
+}
+
+void SetHighPrecisionTimer(bool enable, bool* active) {
+#ifdef _WIN32
+  if (!active) {
+    return;
+  }
+  if (enable && !(*active)) {
+    timeBeginPeriod(1);
+    *active = true;
+  } else if (!enable && *active) {
+    timeEndPeriod(1);
+    *active = false;
+  }
+#else
+  (void)enable;
+  (void)active;
+#endif
+}
+
+double GetMonitorRefreshRateForWindow(GLFWwindow* window) {
+  if (!window) {
+    return 0.0;
+  }
+  int monitor_count = 0;
+  GLFWmonitor** monitors = glfwGetMonitors(&monitor_count);
+  if (!monitors || monitor_count <= 0) {
+    return 0.0;
+  }
+
+  int win_x = 0;
+  int win_y = 0;
+  int win_w = 0;
+  int win_h = 0;
+  glfwGetWindowPos(window, &win_x, &win_y);
+  glfwGetWindowSize(window, &win_w, &win_h);
+  int center_x = win_x + win_w / 2;
+  int center_y = win_y + win_h / 2;
+
+  GLFWmonitor* best_monitor = monitors[0];
+  int best_overlap = -1;
+
+  for (int i = 0; i < monitor_count; ++i) {
+    GLFWmonitor* monitor = monitors[i];
+    if (!monitor) {
+      continue;
+    }
+    int mx = 0;
+    int my = 0;
+    glfwGetMonitorPos(monitor, &mx, &my);
+    const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+    if (!mode) {
+      continue;
+    }
+    int mw = mode->width;
+    int mh = mode->height;
+
+    bool contains_center = center_x >= mx && center_x < (mx + mw) &&
+                           center_y >= my && center_y < (my + mh);
+    if (contains_center) {
+      best_monitor = monitor;
+      break;
+    }
+
+    int overlap_w = std::max(0, std::min(win_x + win_w, mx + mw) -
+                                    std::max(win_x, mx));
+    int overlap_h = std::max(0, std::min(win_y + win_h, my + mh) -
+                                    std::max(win_y, my));
+    int overlap = overlap_w * overlap_h;
+    if (overlap > best_overlap) {
+      best_overlap = overlap;
+      best_monitor = monitor;
+    }
+  }
+
+  const GLFWvidmode* mode = glfwGetVideoMode(best_monitor);
+  if (mode && mode->refreshRate > 0) {
+    return static_cast<double>(mode->refreshRate);
+  }
+  return 0.0;
+}
+
+#ifdef _WIN32
+void ApplyWindowsAppIcon(GLFWwindow* window) {
+  if (!window) {
+    return;
+  }
+
+  HWND hwnd = glfwGetWin32Window(window);
+  if (!hwnd) {
+    return;
+  }
+
+  auto file_exists = [](const std::string& path) -> bool {
+    DWORD attrs = GetFileAttributesA(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+  };
+
+  auto get_executable_dir = []() -> std::string {
+    char exe_path[MAX_PATH] = {0};
+    DWORD len = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+      return "";
+    }
+    std::string path(exe_path, len);
+    size_t pos = path.find_last_of("\\/");
+    if (pos == std::string::npos) {
+      return "";
+    }
+    return path.substr(0, pos);
+  };
+
+  auto join_path = [](const std::string& left,
+                      const std::string& right) -> std::string {
+    if (left.empty()) {
+      return right;
+    }
+    if (left.back() == '\\' || left.back() == '/') {
+      return left + right;
+    }
+    return left + "\\" + right;
+  };
+
+  std::string icon_path;
+  std::string exe_dir = get_executable_dir();
+  std::string candidate_runtime =
+      join_path(exe_dir, "resources\\icon\\icon.ico");
+  if (file_exists(candidate_runtime)) {
+    icon_path = candidate_runtime;
+  } else {
+    std::string candidate_local = join_path(exe_dir, "icon.ico");
+    if (file_exists(candidate_local)) {
+      icon_path = candidate_local;
+    } else if (file_exists("resources\\icon\\icon.ico")) {
+      icon_path = "resources\\icon\\icon.ico";
+    } else if (file_exists("icon.ico")) {
+      icon_path = "icon.ico";
+    }
+  }
+
+  HICON large_icon = nullptr;
+  HICON small_icon = nullptr;
+  if (!icon_path.empty()) {
+    large_icon = static_cast<HICON>(LoadImageA(
+        nullptr, icon_path.c_str(), IMAGE_ICON, 0, 0,
+        LR_LOADFROMFILE | LR_DEFAULTSIZE));
+    small_icon = static_cast<HICON>(
+        LoadImageA(nullptr, icon_path.c_str(), IMAGE_ICON, 16, 16,
+                   LR_LOADFROMFILE | LR_DEFAULTSIZE));
+  }
+
+  if (!large_icon || !small_icon) {
+    HINSTANCE instance = GetModuleHandleA(nullptr);
+    if (instance) {
+      if (!large_icon) {
+        large_icon = static_cast<HICON>(LoadImageA(
+            instance, "IDI_APP_ICON", IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
+      }
+      if (!small_icon) {
+        small_icon = static_cast<HICON>(LoadImageA(
+            instance, "IDI_APP_ICON", IMAGE_ICON, 16, 16, LR_DEFAULTSIZE));
+      }
+    }
+  }
+
+  if (large_icon) {
+    SendMessage(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(large_icon));
+  }
+  if (small_icon) {
+    SendMessage(hwnd, WM_SETICON, ICON_SMALL,
+                reinterpret_cast<LPARAM>(small_icon));
+  }
+}
+
+#endif
+
+}  // namespace
+
+Application::Application(bool enable_debug_mode)
+
+    : window_(nullptr),
+
+      current_mode_(Mode::WIRING),
+
+      current_tool_(ToolType::SELECT),
+
+      running_(false),
+
+      is_plc_running_(false),
+      plc_input_mode_(PlcInputMode::SOURCE),
+      plc_output_mode_(PlcOutputMode::SINK),
+
+      selected_component_id_(-1),
+
+      next_instance_id_(0),
+      next_z_order_(0),
+
+      is_dragging_(false),
+
+      dragged_component_index_(-1),
+      dragged_rtl_module_id_(""),
+
+      is_moving_component_(false),
+
+      moving_component_id_(-1),
+      component_list_view_mode_(ComponentListViewMode::NAME),
+      component_list_filter_(ComponentListFilter::ALL),
+
+      next_wire_id_(0),
+
+      selected_wire_id_(-1),
+      show_tag_popup_(false),
+      tag_edit_wire_id_(-1),
+      tag_color_index_(0),
+
+      is_connecting_(false),
+
+      wire_start_component_id_(-1),
+
+      wire_start_port_id_(-1),
+
+      wire_edit_mode_(WireEditMode::NONE),
+
+      editing_wire_id_(-1),
+
+      editing_point_index_(-1),
+
+      camera_zoom_(1.0f),
+
+      programming_mode_(std::make_unique<ProgrammingMode>(this)),
+
+      simulator_core_(std::make_unique<PLCSimulatorCore>()),
+
+      physics_engine_(nullptr),
+
+      project_file_manager_(std::make_unique<ProjectFileManager>()),
+      rtl_project_manager_(std::make_unique<RtlProjectManager>()),
+      rtl_runtime_manager_(std::make_unique<RtlRuntimeManager>()),
+      physics_accumulator_(0.0),
+      plc_accumulator_(0.0),
+      physics_time_initialized_(false),
+      render_time_initialized_(false),
+      high_precision_timer_active_(false),
+      monitor_refresh_rate_(0.0),
+      warmup_stage_(WarmupStage::kComplete),
+      advanced_physics_disabled_(false),
+      advanced_disable_components_(0),
+      advanced_disable_wires_(0),
+      advanced_accumulator_(0.0),
+      advanced_network_built_(false),
+      advanced_topology_hash_(0),
+      advanced_disable_topology_hash_(0),
+      advanced_last_component_count_(0),
+      advanced_last_wire_count_(0),
+      advanced_last_input_hash_(0),
+      advanced_inputs_dirty_(true),
+      physics_stage_total_ms_(0.0),
+      physics_stage_electrical_ms_(0.0),
+      physics_stage_component_ms_(0.0),
+      physics_stage_pneumatic_ms_(0.0),
+      physics_stage_actuator_ms_(0.0),
+      physics_stage_plc_ms_(0.0),
+      physics_stage_advanced_build_ms_(0.0),
+      physics_stage_advanced_solve_ms_(0.0),
+      physics_stage_advanced_sync_ms_(0.0),
+      physics_stage_advanced_electrical_ms_(0.0),
+      physics_stage_advanced_pneumatic_ms_(0.0),
+      physics_stage_advanced_mechanical_ms_(0.0),
+      physics_stage_steps_(0),
+      physics_stage_advanced_steps_(0),
+      debug_mode_requested_(enable_debug_mode),
+      debug_mode_(false),
+      enable_debug_logging_(false),
+      debug_update_counter_(0),
+      show_physics_warning_dialog_(false),
+      physics_warning_message_(""),
+      show_restart_popup_(false),
+      show_shortcut_help_popup_(false),
+      show_component_context_menu_(false),
+      show_rtl_library_panel_(false),
+      show_rtl_toolchain_panel_(false),
+      rtl_toolchain_loading_(false),
+      rtl_toolchain_status_valid_(false),
+      rtl_async_task_running_(false),
+      selected_rtl_module_id_(""),
+      selected_rtl_source_path_(""),
+      rtl_rename_source_path_(""),
+      rtl_rename_source_buffer_(""),
+      rtl_editor_buffer_(""),
+      rtl_status_message_(""),
+      rtl_editor_height_(560.0f),
+      rtl_editor_font_(nullptr),
+      context_menu_component_id_(-1),
+      context_menu_pos_(ImVec2(0.0f, 0.0f)),
+      font_atlas_window_width_(0),
+      font_atlas_window_height_(0),
+      font_atlas_framebuffer_width_(0),
+      font_atlas_framebuffer_height_(0) {
+
+  drag_start_offset_ = {0, 0};
+  moving_component_offsets_.clear();
+  box_select_pending_ = false;
+  is_box_selecting_ = false;
+  box_select_additive_ = false;
+  box_select_start_world_ = {0.0f, 0.0f};
+  box_select_current_world_ = {0.0f, 0.0f};
+  box_select_press_screen_ = {0.0f, 0.0f};
+  box_select_base_selection_ids_.clear();
+  box_select_base_wire_ids_.clear();
+
+  wire_start_pos_ = {0, 0};
+
+  wire_current_pos_ = {0, 0};
+  std::memset(tag_text_buffer_, 0, sizeof(tag_text_buffer_));
+
+  camera_offset_ = {0.0f, 0.0f};
+  last_pointer_world_pos_ = {0.0f, 0.0f};
+  last_pointer_move_time_ = 0.0;
+  last_auto_waypoint_time_ = 0.0;
+  canvas_directly_hovered_ = false;
+  touch_gesture_active_ = false;
+  touch_zoom_delta_ = 0.0f;
+  touch_pan_delta_ = {0.0f, 0.0f};
+  last_pointer_is_pan_input_ = false;
+  touch_anchor_screen_pos_ = {0.0f, 0.0f};
+  touchpad_zoom_pending_ = false;
+  touchpad_zoom_delta_ = 0.0f;
+  touchpad_zoom_anchor_screen_pos_ = {0.0f, 0.0f};
+  touchpad_pan_pending_ = false;
+  touchpad_pan_delta_ = {0.0f, 0.0f};
+  touchpad_wheel_pending_ = false;
+  touchpad_wheel_delta_ = 0.0f;
+  deferred_canvas_wheel_input_ = Application::DeferredCanvasWheelInput{};
+  prev_right_button_down_ = false;
+  prev_side_button_down_ = false;
+  pen_component_adjust_active_ = false;
+  pen_component_adjust_component_id_ = -1;
+  pen_component_adjust_command_type_ = ComponentInteractionCommandType::None;
+  pen_component_adjust_start_scalar_ = 0.0f;
+  pen_component_adjust_last_angle_ = 0.0f;
+  pen_component_adjust_start_screen_pos_ = {0.0f, 0.0f};
+  ui_settings_ = {};
+  SetDefaultUiSettings(&ui_settings_);
+
+  canvas_top_left_ = {0.0f, 0.0f};
+
+  canvas_size_ = {0.0f, 0.0f};
+
+  snap_settings_.enableGridSnap = true;
+
+  snap_settings_.enablePortSnap = true;
+
+  snap_settings_.enableVerticalSnap = true;
+
+  snap_settings_.enableHorizontalSnap = true;
+
+  snap_settings_.snapDistance = 15.0f;
+  snap_settings_.gridSize = 25.0f;
+
+  g_physics_warning_app = this;
+  SetPhysicsWarningCallback(PhysicsWarningDialogCallback);
+  if (rtl_runtime_manager_) {
+    rtl_runtime_manager_->SetProjectManager(rtl_project_manager_.get());
+  }
+}
+
+Application::~Application() {
+  // Background RTL jobs capture services owned by Application.  A window can
+  // be closed while tool detection or a build is still running, so make the
+  // ownership boundary explicit before member destruction starts.
+  if (rtl_async_task_future_.valid()) {
+    rtl_async_task_future_.wait();
+  }
+  if (rtl_toolchain_future_.valid()) {
+    rtl_toolchain_future_.wait();
+  }
+  if (rtl_tool_setup_future_.valid()) {
+    rtl_tool_setup_future_.wait();
+  }
+  if (rtl_runtime_manager_) {
+    rtl_runtime_manager_->ShutdownAll();
+  }
+  if (g_physics_warning_app == this) {
+    g_physics_warning_app = nullptr;
+  }
+  SetPhysicsWarningCallback(nullptr);
+}
+
+bool Application::Initialize() {
+  InitializeLanguage();
+  LoadUiSettings(&ui_settings_);
+
+#ifdef _WIN32
+  ApplyWindowsEfficiencyModeCompatibility(GetCurrentProcess(),
+                                          GetCurrentThread());
+#endif
+
+
+  if (!InitializeWindow())
+
+    return false;
+
+  if (!InitializeImGui())
+
+    return false;
+
+  if (programming_mode_)
+
+    programming_mode_->Initialize();
+
+  if (simulator_core_ && !simulator_core_->Initialize()) {
+
+    std::cerr << "Failed to initialize PLCSimulatorCore!" << std::endl;
+
+    return false;
+
+  }
+
+  physics_engine_ = CreateDefaultPhysicsEngine();
+
+  if (!physics_engine_) {
+
+    std::cerr << "Failed to create PhysicsEngine!" << std::endl;
+
+    return false;
+
+  }
+
+
+
+  std::cout << "[Application] PhysicsEngine initialized successfully"
+
+            << std::endl;
+
+  compiled_plc_executor_ = std::make_unique<CompiledPLCExecutor>();
+
+  compiled_plc_executor_->SetDebugMode(false);
+
+  compiled_plc_executor_->ResetMemory();
+  compiled_plc_executor_->SetContinuousExecution(true, kPlcScanStepMs);
+
+
+
+  std::cout << "[Application] Compiled PLC Executor initialized successfully"
+
+            << std::endl;
+
+  std::cout << std::endl;
+
+  std::cout << "=====================================" << std::endl;
+
+  std::cout << "=====================================" << std::endl;
+
+  std::cout << "  PLC Simulator Controls" << std::endl;
+
+  std::cout << "=====================================" << std::endl;
+
+  std::cout << "Debug: launch with --Debug" << std::endl;
+
+  std::cout << std::endl;
+
+  if (debug_mode_requested_) {
+    ToggleDebugMode();
+    DebugLog("[DEBUG] Debug mode requested via --Debug");
+  }
+
+  RequestCacheWarmup();
+  running_ = true;
+
+  return true;
+
+}
+
+void Application::Run() {
+
+  while (running_ && !glfwWindowShouldClose(window_)) {
+
+#ifdef _WIN32
+    ApplyWindowsEfficiencyModeCompatibility(GetCurrentProcess(),
+                                            GetCurrentThread());
+#endif
+
+    ProcessInput();
+    BeginFrame();
+
+    Update();
+
+    Render();
+
+  }
+
+}
+
+void Application::Shutdown() {
+  // Do not tear down audio/runtime services underneath an in-flight RTL job.
+  // std::future's implicit wait happens too late (during member destruction)
+  // for services explicitly shut down below.
+  if (rtl_async_task_future_.valid()) {
+    rtl_async_task_future_.wait();
+  }
+  if (rtl_toolchain_future_.valid()) {
+    rtl_toolchain_future_.wait();
+  }
+  if (rtl_tool_setup_future_.valid()) {
+    rtl_tool_setup_future_.wait();
+  }
+  ShutdownAudioStreamBridge();
+  ShutdownAudioCircuitRuntime();
+  if (rtl_runtime_manager_) {
+    rtl_runtime_manager_->ShutdownAll();
+  }
+
+  if (physics_engine_) {
+
+    DestroyPhysicsEngine(physics_engine_);
+
+    physics_engine_ = nullptr;
+
+    std::cout << "[Application] PhysicsEngine destroyed" << std::endl;
+
+  }
+
+
+
+  if (simulator_core_) {
+
+    simulator_core_->Shutdown();
+
+  }
+
+
+
+  Cleanup();
+
+}
+
+void Application::Update() {
+  PollRtlAsyncTask();
+  PollRtlToolSetup();
+  PollRtlToolchainRefresh();
+
+  if (ProcessCacheWarmup()) {
+    return;
+  }
+
+  if (programming_mode_ && current_mode_ == Mode::PROGRAMMING) {
+
+
+
+    programming_mode_->UpdateWithPlcState(is_plc_running_);
+
+  }
+
+
+
+
+
+
+
+  UpdatePortPositions();
+
+
+
+
+
+  UpdatePhysicsLod();
+  UpdatePhysics();
+  UpdateAudioCircuitRuntime(
+      &placed_components_, wires_, is_plc_running_,
+      ui_settings_.audio_min_volume_percent,
+      ui_settings_.audio_max_volume_percent,
+      ui_settings_.audio_output_device_id,
+      rtl_runtime_manager_.get());
+  UpdateAudioStreamBridge(is_plc_running_ && !rtl_tool_setup_running_,
+                          ui_settings_.audio_input_device_id,
+                          ui_settings_.audio_output_device_id,
+                          ui_settings_.audio_buffer_ms,
+                          ui_settings_.audio_max_volume_percent);
+
+
+
+
+
+
+  if (debug_mode_) {
+
+    UpdateDebugLogging();
+
+  }
+
+}
+
+void Application::RequestCacheWarmup() {
+  warmup_stage_ = WarmupStage::kPending;
+  advanced_network_built_ = false;
+  advanced_physics_disabled_ = false;
+  advanced_disable_components_ = 0;
+  advanced_disable_wires_ = 0;
+  advanced_accumulator_ = 0.0;
+  advanced_last_component_count_ = 0;
+  advanced_last_wire_count_ = 0;
+  advanced_topology_hash_ = 0;
+  advanced_disable_topology_hash_ = 0;
+  advanced_last_input_hash_ = 0;
+  advanced_inputs_dirty_ = true;
+  physics_stage_total_ms_ = 0.0;
+  physics_stage_electrical_ms_ = 0.0;
+  physics_stage_component_ms_ = 0.0;
+  physics_stage_pneumatic_ms_ = 0.0;
+  physics_stage_actuator_ms_ = 0.0;
+  physics_stage_plc_ms_ = 0.0;
+  physics_stage_advanced_build_ms_ = 0.0;
+  physics_stage_advanced_solve_ms_ = 0.0;
+  physics_stage_advanced_sync_ms_ = 0.0;
+  physics_stage_advanced_electrical_ms_ = 0.0;
+  physics_stage_advanced_pneumatic_ms_ = 0.0;
+  physics_stage_advanced_mechanical_ms_ = 0.0;
+  physics_stage_steps_ = 0;
+  physics_stage_advanced_steps_ = 0;
+}
+
+bool Application::ProcessCacheWarmup() {
+  if (warmup_stage_ == WarmupStage::kComplete) {
+    return false;
+  }
+
+  if (warmup_stage_ == WarmupStage::kPending) {
+    warmup_stage_ = WarmupStage::kRunning;
+    return true;
+  }
+
+  if (warmup_stage_ == WarmupStage::kRunning) {
+    RunCacheWarmup();
+    warmup_stage_ = WarmupStage::kFinishing;
+    return true;
+  }
+
+  if (warmup_stage_ == WarmupStage::kFinishing) {
+    warmup_stage_ = WarmupStage::kComplete;
+    return false;
+  }
+
+  warmup_stage_ = WarmupStage::kComplete;
+  return false;
+}
+
+void Application::RunCacheWarmup() {
+  UpdatePortPositions();
+  SimulateElectrical();
+  SimulatePneumatic();
+  UpdateComponentLogic();
+  UpdateSensorsBox2d();
+  UpdateWorkpieceInteractionsBox2d(0.0f, true);
+  PrewarmAdvancedPhysicsNetworks();
+}
+
+bool Application::InitializeWindow() {
+
+  if (!glfwInit()) {
+
+    printf("Failed to initialize GLFW!\n");
+
+    return false;
+
+  }
+
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+
+  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+  window_ = glfwCreateWindow(1920, 1080, "Audio Circuit Simulator",
+
+                              nullptr, nullptr);
+
+  if (!window_) {
+
+    glfwTerminate();
+
+    return false;
+
+  }
+
+  glfwMakeContextCurrent(window_);
+
+#ifdef _WIN32
+  ApplyWindowsAppIcon(window_);
+#endif
+
+  glfwSwapInterval(ui_settings_.vsync_enabled ? 1 : 0);
+
+  monitor_refresh_rate_ = GetMonitorRefreshRateForWindow(window_);
+  SetHighPrecisionTimer(ui_settings_.frame_limit_enabled &&
+                            !ui_settings_.vsync_enabled,
+                        &high_precision_timer_active_);
+
+  if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(glfwGetProcAddress))) {
+
+    return false;
+
+  }
+
+#ifdef _WIN32
+  InstallWin32InputHook(window_, this);
+  InitTouchpadHaptics();
+#endif
+
+
+
+  printf("=== PLC Simulator Started ===\n");
+
+  return true;
+
+}
+
+bool Application::InitializeImGui() {
+
+  IMGUI_CHECKVERSION();
+
+  ImGui::CreateContext();
+
+  ImGuiIO& io = ImGui::GetIO();
+
+  (void)io;
+
+  RebuildImGuiFonts(GetAutoFontScale());
+
+  SetupCustomStyle();
+
+  ImGui_ImplGlfw_InitForOpenGL(window_, true);
+
+  ImGui_ImplOpenGL3_Init("#version 330");
+
+  if (window_) {
+    glfwGetWindowSize(window_, &font_atlas_window_width_,
+                      &font_atlas_window_height_);
+    glfwGetFramebufferSize(window_, &font_atlas_framebuffer_width_,
+                           &font_atlas_framebuffer_height_);
+  }
+
+  return true;
+
+}
+
+float Application::GetAutoFontScale() const {
+  if (window_) {
+    int width = 0;
+    int height = 0;
+    glfwGetWindowSize(window_, &width, &height);
+    if (width > 0 && height > 0) {
+      const float resolution_scale =
+          GetResolutionScaleForDisplaySize(static_cast<float>(width),
+                                           static_cast<float>(height));
+      return resolution_scale >= 1.25f ? resolution_scale : 1.0f;
+    }
+  }
+
+  const float resolution_scale = GetResolutionScale();
+  return resolution_scale >= 1.25f ? resolution_scale : 1.0f;
+}
+
+bool Application::RebuildImGuiFonts(float auto_font_scale) {
+  if (!ImGui::GetCurrentContext()) {
+    return false;
+  }
+
+  ImGuiIO& io = ImGui::GetIO();
+  if (!io.Fonts) {
+    return false;
+  }
+
+  io.Fonts->Clear();
+
+  ImFontConfig font_config;
+  font_config.PixelSnapH = true;
+  float font_size = 16.0f * ui_settings_.font_scale * auto_font_scale;
+
+  static const ImWchar korean_ranges[] = {
+      0x0020, 0x00FF, 0x2500, 0x257F, 0x3131, 0x3163, 0xAC00,
+      0xD7A3, 0x2010, 0x205E, 0xFF01, 0xFF5E, 0,
+  };
+
+  io.Fonts->AddFontFromFileTTF("resources/fonts/unifont.ttf", font_size,
+                               &font_config, korean_ranges);
+
+  ImFontConfig merge_config = font_config;
+  merge_config.MergeMode = true;
+  const ImWchar* jp_ranges = io.Fonts->GetGlyphRangesJapanese();
+  io.Fonts->AddFontFromFileTTF("resources/fonts/JP.ttf", font_size,
+                               &merge_config, jp_ranges);
+  ImFontConfig mono_config = font_config;
+  mono_config.MergeMode = false;
+  mono_config.PixelSnapH = true;
+  rtl_editor_font_ = io.Fonts->AddFontFromFileTTF(
+      "resources/fonts/JetBrainsMono.ttf",
+      16.0f * ui_settings_.font_scale * auto_font_scale,
+      &mono_config, io.Fonts->GetGlyphRangesDefault());
+  if (rtl_editor_font_) {
+    ImFontConfig mono_merge_config = font_config;
+    mono_merge_config.MergeMode = true;
+    mono_merge_config.PixelSnapH = true;
+    mono_merge_config.DstFont = rtl_editor_font_;
+    io.Fonts->AddFontFromFileTTF("resources/fonts/unifont.ttf", font_size,
+                                 &mono_merge_config, korean_ranges);
+    io.Fonts->AddFontFromFileTTF("resources/fonts/JP.ttf", font_size,
+                                 &mono_merge_config, jp_ranges);
+  }
+  io.Fonts->Build();
+  io.FontGlobalScale = 1.0f;
+  return true;
+}
+
+void Application::RefreshImGuiFontsIfNeeded() {
+  if (!window_ || !ImGui::GetCurrentContext()) {
+    return;
+  }
+
+  int window_width = 0;
+  int window_height = 0;
+  int framebuffer_width = 0;
+  int framebuffer_height = 0;
+  glfwGetWindowSize(window_, &window_width, &window_height);
+  glfwGetFramebufferSize(window_, &framebuffer_width, &framebuffer_height);
+  if (window_width <= 0 || window_height <= 0 ||
+      framebuffer_width <= 0 || framebuffer_height <= 0) {
+    return;
+  }
+
+  const bool resolution_changed =
+      window_width != font_atlas_window_width_ ||
+      window_height != font_atlas_window_height_ ||
+      framebuffer_width != font_atlas_framebuffer_width_ ||
+      framebuffer_height != font_atlas_framebuffer_height_;
+  if (!resolution_changed) {
+    return;
+  }
+
+  if (!RebuildImGuiFonts(GetAutoFontScale())) {
+    return;
+  }
+
+  ImGui_ImplOpenGL3_DestroyFontsTexture();
+  ImGui_ImplOpenGL3_CreateFontsTexture();
+
+  font_atlas_window_width_ = window_width;
+  font_atlas_window_height_ = window_height;
+  font_atlas_framebuffer_width_ = framebuffer_width;
+  font_atlas_framebuffer_height_ = framebuffer_height;
+}
+
+void Application::SetupCustomStyle() {
+
+  ImGuiStyle& style = ImGui::GetStyle();
+
+  style.WindowRounding = 8.0f;
+
+  style.ChildRounding = 6.0f;
+
+  style.FrameRounding = 4.0f;
+
+  style.PopupRounding = 4.0f;
+
+  style.ScrollbarRounding = 4.0f;
+
+  style.GrabRounding = 4.0f;
+
+  style.TabRounding = 4.0f;
+
+  style.WindowPadding = ImVec2(12, 8);
+
+  style.FramePadding = ImVec2(8, 4);
+
+  style.ItemSpacing = ImVec2(8, 4);
+
+  style.ItemInnerSpacing = ImVec2(4, 4);
+
+  style.ScrollbarSize = 16.0f;
+
+  ImVec4* colors = style.Colors;
+
+  colors[ImGuiCol_Text] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
+
+  colors[ImGuiCol_TextDisabled] = ImVec4(0.60f, 0.60f, 0.60f, 1.00f);
+
+  colors[ImGuiCol_WindowBg] = ImVec4(0.98f, 0.98f, 0.98f, 1.00f);
+
+  colors[ImGuiCol_ChildBg] = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+
+  colors[ImGuiCol_PopupBg] = ImVec4(1.00f, 1.00f, 1.00f, 0.98f);
+
+  colors[ImGuiCol_Border] = ImVec4(0.85f, 0.85f, 0.85f, 1.00f);
+
+  colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+
+  colors[ImGuiCol_FrameBg] = ImVec4(0.96f, 0.96f, 0.96f, 1.00f);
+
+  colors[ImGuiCol_FrameBgHovered] = ImVec4(0.92f, 0.92f, 0.92f, 1.00f);
+
+  colors[ImGuiCol_FrameBgActive] = ImVec4(0.88f, 0.88f, 0.88f, 1.00f);
+
+  colors[ImGuiCol_TitleBg] = ImVec4(0.90f, 0.90f, 0.90f, 1.00f);
+
+  colors[ImGuiCol_TitleBgActive] = ImVec4(0.82f, 0.82f, 0.82f, 1.00f);
+
+  colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.90f, 0.90f, 0.90f, 0.75f);
+
+  colors[ImGuiCol_MenuBarBg] = ImVec4(0.94f, 0.94f, 0.94f, 1.00f);
+
+  colors[ImGuiCol_ScrollbarBg] = ImVec4(0.96f, 0.96f, 0.96f, 1.00f);
+
+  colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
+
+  colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.70f, 0.70f, 0.70f, 1.00f);
+
+  colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.60f, 0.60f, 0.60f, 1.00f);
+
+  colors[ImGuiCol_CheckMark] = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
+
+  colors[ImGuiCol_SliderGrab] = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
+
+  colors[ImGuiCol_SliderGrabActive] = ImVec4(0.06f, 0.53f, 0.98f, 1.00f);
+
+  colors[ImGuiCol_Button] = ImVec4(0.92f, 0.92f, 0.92f, 1.00f);
+
+  colors[ImGuiCol_ButtonHovered] = ImVec4(0.88f, 0.88f, 0.88f, 1.00f);
+
+  colors[ImGuiCol_ButtonActive] = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
+
+  colors[ImGuiCol_Header] = ImVec4(0.90f, 0.90f, 0.90f, 1.00f);
+
+  colors[ImGuiCol_HeaderHovered] = ImVec4(0.86f, 0.86f, 0.86f, 1.00f);
+
+  colors[ImGuiCol_HeaderActive] = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
+
+  colors[ImGuiCol_Separator] = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
+
+  colors[ImGuiCol_SeparatorHovered] = ImVec4(0.70f, 0.70f, 0.70f, 1.00f);
+
+  colors[ImGuiCol_SeparatorActive] = ImVec4(0.60f, 0.60f, 0.60f, 1.00f);
+
+  style.ScaleAllSizes(ui_settings_.ui_scale);
+}
+
+bool Application::RestartApplication() {
+#ifdef _WIN32
+  const wchar_t* cmd = GetCommandLineW();
+  if (!cmd || cmd[0] == L'\0') {
+    return false;
+  }
+  wchar_t cmdline[32768] = {0};
+  lstrcpynW(cmdline, cmd, static_cast<int>(_countof(cmdline)));
+  STARTUPINFOW startup_info = {};
+  PROCESS_INFORMATION process_info = {};
+  startup_info.cb = sizeof(startup_info);
+  BOOL created = CreateProcessW(nullptr, cmdline, nullptr, nullptr, FALSE, 0,
+                                nullptr, nullptr, &startup_info,
+                                &process_info);
+  if (!created) {
+    return false;
+  }
+  CloseHandle(process_info.hProcess);
+  CloseHandle(process_info.hThread);
+  running_ = false;
+  if (window_) {
+    glfwSetWindowShouldClose(window_, GLFW_TRUE);
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
+void Application::Cleanup() {
+  SetHighPrecisionTimer(false, &high_precision_timer_active_);
+
+  ImGui_ImplOpenGL3_Shutdown();
+
+  ImGui_ImplGlfw_Shutdown();
+
+  ImGui::DestroyContext();
+
+#ifdef _WIN32
+  ShutdownTouchpadHaptics();
+  UninstallWin32InputHook(window_);
+#endif
+
+  if (window_)
+
+    glfwDestroyWindow(window_);
+
+  glfwTerminate();
+
+}
+
+
+
+}  // namespace plc
